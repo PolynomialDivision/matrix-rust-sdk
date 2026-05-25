@@ -219,9 +219,37 @@ impl<'a> IntoFuture for SendRawMessageLikeEvent<'a> {
                     let olm = room.client.olm_machine().await;
                     let olm = olm.as_ref().expect("Olm machine wasn't started");
 
+                    // MSC3952: extract `m.mentions` from the plaintext content
+                    // before encryption so we can place it in the unencrypted
+                    // outer wrapper. This lets the homeserver evaluate push
+                    // rules (e.g. @room highlights) for encrypted messages.
+                    let plaintext_mentions: Option<serde_json::Value> = content
+                        .deserialize_as::<serde_json::Value>()
+                        .ok()
+                        .and_then(|v| v.get("m.mentions").cloned());
+
                     let result =
                         olm.encrypt_room_event_raw(room.room_id(), event_type, &content).await?;
-                    content = result.content.cast();
+
+                    // Inject `m.mentions` into the unencrypted event wrapper.
+                    content = if let Some(mentions) = plaintext_mentions {
+                        match result.content.deserialize_as::<serde_json::Value>() {
+                            Ok(mut outer) => {
+                                outer["m.mentions"] = mentions;
+                                match Raw::new(&outer) {
+                                    // Safety: we just serialized a valid JSON value,
+                                    // and the underlying bytes are the same shape as
+                                    // AnyMessageLikeEventContent (raw JSON).
+                                    Ok(raw) => raw.cast_unchecked(),
+                                    Err(_) => result.content.cast(),
+                                }
+                            }
+                            Err(_) => result.content.cast(),
+                        }
+                    } else {
+                        result.content.cast()
+                    };
+
                     encryption_info = Some(result.encryption_info);
                     event_type = "m.room.encrypted";
                 }
